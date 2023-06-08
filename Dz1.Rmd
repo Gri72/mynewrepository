@@ -1,0 +1,336 @@
+---
+title: "Homework 1"
+author: "Tatyana Kim"
+output:
+  md_document:
+    variant: markdown_github
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(fig.width = 10,cache=T)
+```
+
+```{r}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+# getwd()
+```
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(dada2)
+library(phyloseq)
+set.seed(5678)
+```
+
+## Загрузка данных
+
+```{r}
+path <- 'sequences'
+list.files(path)[1:6]
+```
+
+```{r}
+metadata <- read.csv('map.csv')
+metadata$SampleID <- paste(metadata$Source, metadata$Site, metadata$Horizont, metadata$Repeat, sep=".")
+```
+
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names[1:6]
+```
+
+## DADA2 пайплайн
+
+### Проверка качества исходных прочтений
+
+**Прямые прочтения**
+
+```{r}
+plot_Fs <- plotQualityProfile(fnFs, aggregate = T)
+plot_Fs <- plot_Fs + ggtitle('Качество исходных прямых прочетний')
+ggsave('plot_Fs.png',plot_Fs, dpi=300, width=6, height = 5)
+plot_Fs
+```
+
+В начале прочетний качество чуть хуже, но потом становится стабильно высоким. К концу прочтений качество ухудшается. Не все прочтения длинной 300 bp (красная линия).
+
+**Обратные прочтения**
+
+```{r}
+plot_Rs <- plotQualityProfile(fnRs, aggregate = T)
+plot_Rs <- plot_Rs + ggtitle('Качество исходных обратных прочетний')
+ggsave('plot_Rs.png',plot_Rs, dpi=300, width=6, height = 5)
+plot_Rs
+```
+
+Качество схоже с прямыми прочтениями, но общее качество начинается падать раньше.
+
+### Тримминг прочтений
+
+```{r}
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,180),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE)
+head(out)
+```
+
+Проверим качество прочтений после тримминга
+
+**Прямые прочтения**
+
+```{r}
+plot_filtFs <- plotQualityProfile(filtFs, aggregate = T)
+plot_filtFs <- plot_filtFs + ggtitle('Качество прямых прочетний после тримминга')
+ggsave('plot_filtFs.png',plot_filtFs, dpi=300, width=6, height = 5)
+plot_filtFs
+```
+
+Длина прочтений уменьшилась, все прочтения имеют одинаковую длину 240 bp. Общее качество прочтений улучшилось, но ступенчатый паттерн в начале остался. Качество прочтений стало подходящим для дальнейшего анализа.
+
+**Обратные прочтения**
+
+```{r}
+plot_filtRs <- plotQualityProfile(filtRs, aggregate = T)
+plot_filtRs <- plot_filtRs + ggtitle('Качество обратных прочетний после тримминга')
+ggsave('plot_filtRs.png',plot_filtRs, dpi=300, width=6, height = 5)
+plot_filtRs
+
+```
+
+Аналогично прямым прочтениям. Длина прочтений стала меньше 180 bp.
+
+### Построение и применение модели
+
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+```{r}
+plot_errF <- plotErrors(errF, nominalQ=TRUE) + ggtitle('Прямые прочтения')
+ggsave('plot_errF.png',plot_errF, dpi=300, width=8, height = 6)
+plot_errF
+```
+
+```{r}
+plot_errR <- plotErrors(errR, nominalQ=TRUE) + ggtitle('Обратные прочтения')
+ggsave('plot_errR.png',plot_errR, dpi=300, width=8, height = 6)
+plot_errR
+```
+
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+```
+
+### Объединение прочтений и создание таблицы
+
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+```
+
+```{r}
+seqtab <- makeSequenceTable(mergers)
+```
+
+### Удаление химер
+
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+### Проверка количества прочтений на каждой стадии предобработки
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+```{r}
+stages_df <- as.data.frame(track) 
+stages_df$sample <- rownames(stages_df)
+stages_df <- stages_df %>% gather('stage', 'nreads',-sample)
+stages_df$stage <- factor(stages_df$stage,level=colnames(track))
+ggplot(stages_df,aes(x=stage, y=nreads, color=stage))+
+  geom_boxplot()+xlab('Стадия предобработки')+
+  ylab('Количество прочтений')+
+  theme(legend.position = 'none') -> plot_stages 
+
+ggsave('plot_stages.png', plot_stages, dpi=300, width=7, height = 5)
+plot_stages
+```
+
+Наблюдается значительное уменьшение количества прочтений после тримминга и фильтрации и после слияния прочтений. Чтобы осталось больше прочтений можно сделать фильтрацию более слабой. Такое сильное снижение может говорить о среднем качестве секвенирования.
+
+### Аннотация таксономии
+
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "silva_nr_v132_train_set.fa.gz", multithread=TRUE)
+
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+```{r}
+rownames(metadata) <- metadata$Filename
+
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(metadata), 
+               tax_table(taxa))
+ps
+```
+
+### Переименнование объекта phyloseq
+
+```{r}
+## Rename Samples
+new.names <- ps@sam_data %>% 
+  data.frame() %>% 
+  dplyr::select(Filename, SampleID) %>%  
+  arrange(Filename, levels = sample_names(ps))
+
+if (all(sample_names(ps) == new.names$Filename)) {
+  sample_names(ps) <- ps@sam_data$SampleID
+  print("Renamed")
+}
+sample_names(ps)
+```
+
+```{r}
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+```
+
+### Сохранение объекта phyloseq и рассчет контрольной суммы
+
+```{r}
+saveRDS(ps, "ps.RData")
+ps <- readRDS("ps.RData")
+
+tools::md5sum("ps.RData")
+```
+
+## EDA-анализ
+
+```{r}
+sample_sums(ps) %>% sort(decreasing = T)
+```
+
+```{r}
+taxa_sums(ps) %>%  hist()
+```
+
+### Удаление хлоропластов и митохондрий
+
+```{r}
+ps.filtered <- subset_taxa(ps, Phylum != "NA")
+
+asvs.keep <-ps@tax_table %>% 
+      data.frame() %>%  
+      filter((Family != "Mitochondria" & Order != "Chloroplast") %>%
+              replace_na(TRUE)) %>% 
+      rownames()
+ps.notrash <- prune_taxa(asvs.keep, ps.filtered)
+```
+
+### Доля филумов в образцах
+
+```{r}
+bargraph <- function(ps, rank, threshold=0.05, percents=FALSE){
+  require(dplyr)
+  require(ggplot2)
+  require(phyloseq)
+  
+  ps <- prune_taxa(taxa_sums(ps) > 0, ps)
+  ps2 <- tax_glom(ps, taxrank = rank)
+  ps3 = transform_sample_counts(ps2, function(x) x / sum(x) )
+  data <- psmelt(ps3) # create dataframe from phyloseq object
+  data$Plot <- as.character(data[,rank]) # convert to character
+  data$Plot[data$Abundance < threshold] <- paste0("<", threshold, " abund.")
+  medians <- data %>% group_by(Plot) %>% mutate(median=median(data$Abundance))
+  remainder <- medians[medians$median <= threshold,]$Plot
+  data$Percentage = ifelse(data$Plot != paste0("<", threshold, " abund."),
+                           round(data$Abundance, 3)*100, NA)
+  
+  # create palette long enough for our data
+  base.palette <- c("darkblue", "darkgoldenrod1", "darkseagreen", "darkorchid", "darkolivegreen1", "lightskyblue", 
+                    "darkgreen", "deeppink", "khaki2", "firebrick", "brown1", "darkorange1", "cyan1", "royalblue4", 
+                    "darksalmon", "dodgerblue3", "steelblue1", "darkgoldenrod1", "brown1", "cyan1", "darkgrey")
+  required.colors <- nlevels(factor(data$Plot))
+  repeats = required.colors %/% length(base.palette) + 1
+  palette <- rep(base.palette, length.out = repeats * length(base.palette))
+  
+  p <- ggplot(data=data, aes(x=Sample, y=Abundance, fill=Plot))
+  p + geom_bar(aes(), stat="identity", position="stack") + theme_light() +
+    scale_fill_manual(values = palette) +
+    theme(legend.position="bottom") + guides() +
+    theme(axis.text.x = element_text(angle = 90)) +
+    if (percents) {
+      geom_text(aes(label = Percentage),
+                position = position_stack(vjust = 0.5), size = 1.5)
+    }
+  
+}
+
+bargraph(ps.notrash, "Phylum", 0.02) +
+  facet_grid(~Horizont + Source ,scales = 'free_x') +
+  theme(axis.text.x = element_blank())
+
+```
+
+-   Для **почвы террикона угольных шахт** преобладают филумы Actinobacteria и Chloroflexi. Последний филлум представлен наибольшей долей, чем в остальных почвах. Только для этих почв выделяется филум Firmicutes. Только в этих почвах почти не представлены филумы Verrucomicrobia, Bacteroidetes, Acidobacteria.
+
+-   Для всех почв кроме почвы террикона угольных шахт большую долю составляет филум Proteobacteria
+
+-   Для почвы **литострат** филумы распределены относительно равномерно без конкретных выдающихся филумов
+
+### Альфа разнообразие
+
+```{r}
+ps.raref <- rarefy_even_depth(ps.notrash, sample.size = 8000)
+```
+
+```{r}
+plot_richness(ps.raref, x = "Source", measures=c("Observed", "Shannon"), color = "Horizont")
+```
+
+Обе метрики показывают схожие результаты. Почва **самозарастания отвальных пород** обладает наибольшим альфа-разнообразием, а почва **террикона угольных шахт** наименьшим для обоих метрик. В среднем горизонт почвы AY показывает большее разнообразие, чем горизонт C. Это логично, потому что горизонт C находится глубже горизонта AY.
+
+### Бета разнообразие
+
+Производим ординацию, преобразование многомерного пространства в двухмерное с помощью метода NMDS.
+
+```{r}
+ordinations <- ordinate(ps.notrash, "NMDS", "bray")
+```
+
+```{r}
+plot_ordination(ps.notrash, ordinations, type="taxa", color="Phylum")
+```
+
+Выделить кластеры соотвествующие кластеры для конкретных видов не получается.
+
+```{r}
+plot_ordination(ps.notrash, ordinations, type="samples", color="Source", shape = "Horizont")
+```
+
+Для каждого типа почв получаются свои обособленные кластеры. Разные горизонты почв имеют разные знаки по оси NMDS1. Песчаная почва и почва регионального рефернса очень схожи.
